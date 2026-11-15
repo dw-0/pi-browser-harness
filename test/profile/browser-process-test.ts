@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  browserFamilyOf,
   flatpakAppIdFromCgroup,
   isLinuxBrowserComm,
   parseProcCmdline,
@@ -227,5 +228,23 @@ describe("browser-process parsing and candidate ranking", () => {
       chmodSync(literal, 0o755);
       assert.equal(await spawnableExePath(literal), literal);
     });
+  });
+});
+
+describe("browserFamilyOf", () => {
+  test("a flatpak app id names the family even when the exe path would mislead", () => {
+    // A sandboxed browser's argv[0] can look like a plain install path; the cgroup app id is the family evidence.
+    assert.equal(browserFamilyOf({ running: true, flatpakAppId: "com.google.Chrome", exePath: "/app/extra/chrome" }), "Chrome");
+    assert.equal(browserFamilyOf({ running: true, flatpakAppId: "com.brave.Browser", exePath: "/app/extra/brave" }), "Brave");
+  });
+  test("executable names map to families", () => {
+    assert.equal(browserFamilyOf({ running: true, exePath: "/usr/bin/google-chrome" }), "Chrome");
+    assert.equal(browserFamilyOf({ running: true, exePath: "/usr/lib/chromium/chromium-browser" }), "Chromium");
+    assert.equal(browserFamilyOf({ running: true, exePath: "/usr/bin/brave-browser" }), "Brave");
+    assert.equal(browserFamilyOf({ running: true, exePath: "/opt/microsoft/msedge/msedge" }), "Edge");
+  });
+  test("an explicit user-data-dir is the fallback", () => {
+    assert.equal(browserFamilyOf({ running: true, explicitUserDataDir: "/home/u/.config/BraveSoftware/Brave-Browser" }), "Brave");
+    assert.equal(browserFamilyOf({ running: true }), undefined);
   });
 });

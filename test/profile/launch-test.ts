@@ -132,12 +132,10 @@ describe("openProfileWindow's flatpak launch", () => {
     try {
       const r = await openProfileWindow({ flatpakAppId: "com.google.Chrome", profileDir: "Default" });
       assert.ok(r.success);
-      if (r.success) {
-        // spawn succeeding is not the stub having run: wait for the argv file to appear.
-        const deadline = Date.now() + 2000;
-        while (!existsSync(join(root, "argv")) && Date.now() < deadline) await new Promise((res) => setTimeout(res, 20));
-        await r.data.cleanup();
-      }
+      // spawn succeeding is not the stub having run: wait for the argv file to appear.
+      const deadline = Date.now() + 2000;
+      while (!existsSync(join(root, "argv")) && Date.now() < deadline) await new Promise((res) => setTimeout(res, 20));
+      await r.data.cleanup();
     } finally {
       process.env["PATH"] = oldPath;
     }

@@ -11,6 +11,7 @@ import { cdpError } from "../../src/cdp/errors";
 import { err, ok } from "../../src/util/result";
 import type { BrowserLocation } from "../../src/browser-location";
 import type { InstalledBrowser } from "../../src/profile/installed";
+import type { RunningBrowser } from "../../src/profile/browser-process";
 import type { BrowserLaunchRequest } from "../../src/profile/launch";
 import { createFakeClient, type FakeClient } from "../domains/fake-client";
 import { fakeCtx, fakePi } from "../helpers/fake-pi";
@@ -19,6 +20,44 @@ import { underNeverActivate } from "../helpers/never-activate";
 const PIN: ProfilePin = { userDataDir: "/home/u/.config/google-chrome", profileDir: "Default", label: "Alice", savedAt: "" };
 
 const REMOTE_ENDPOINT = { wsUrl: "ws://127.0.0.1:9222/devtools/browser/remote" };
+const UP: BrowserLocation = { kind: "local", endpoint: { wsUrl: "ws://127.0.0.1:9222/devtools/browser/x", userDataDir: PIN.userDataDir } };
+
+// The locator answers "none" first (which is what triggers a launch), then walks `after`, repeating its last entry.
+const closed = (opts: {
+  readonly installed: ReadonlyArray<InstalledBrowser>;
+  readonly after?: ReadonlyArray<BrowserLocation>;
+  readonly launchError?: string;
+  readonly display?: boolean;
+  readonly lookupMs?: number;
+  // Which browser process (if any) is running while none is reachable.
+  readonly running?: RunningBrowser;
+}) => {
+  const launches: BrowserLaunchRequest[] = [];
+  const after = opts.after ?? [UP];
+  let asked = 0;
+  // A clock that only sleeping (and, when asked, a slow lookup) moves, so waits are exact and instant.
+  let clock = 0;
+  const deps: SetupDeps = {
+    now: () => clock,
+    ensureDaemon: () => Promise.resolve(true),
+    readPin: () => Promise.resolve(null),
+    detectRunningBrowser: () => Promise.resolve(opts.running ?? { running: false }),
+    installedBrowsers: () => Promise.resolve(opts.installed),
+    canShowWindow: () => opts.display ?? true,
+    sleep: (ms) => { clock += ms; return Promise.resolve(); },
+    launchBrowser: (req) => {
+      launches.push(req);
+      return Promise.resolve(opts.launchError === undefined ? ok(undefined) : err(opts.launchError));
+    },
+    locateBrowser: () => {
+      const answer: BrowserLocation = asked === 0 ? { kind: "none" } : after[Math.min(asked - 1, after.length - 1)] ?? { kind: "none" };
+      asked++;
+      clock += opts.lookupMs ?? 0;
+      return Promise.resolve(answer);
+    },
+  };
+  return { deps, launches, lookups: () => asked - 1, elapsed: () => clock };
+};
 
 const ready: SetupDeps = {
   locateBrowser: () => Promise.resolve({ kind: "local" }),
@@ -26,6 +65,8 @@ const ready: SetupDeps = {
   // Nothing installed, so a test that reports "no browser" can never launch a real one.
   installedBrowsers: () => Promise.resolve([]),
   readPin: () => Promise.resolve(null),
+  // No running browser process: the pin cannot name a different one that is open.
+  detectRunningBrowser: () => Promise.resolve({ running: false }),
 };
 
 type SetupClient = {
@@ -228,41 +269,6 @@ describe("performSetup with a closed local browser", () => {
   const CHROME: InstalledBrowser = { family: "Chrome", exePath: "/usr/bin/google-chrome" };
   const BRAVE: InstalledBrowser = { family: "Brave", exePath: "/usr/bin/brave-browser" };
   const BRAVE_PIN: ProfilePin = { userDataDir: "/home/u/.config/BraveSoftware/Brave-Browser", profileDir: "Profile 2", label: "Work", savedAt: "" };
-  const UP: BrowserLocation = { kind: "local", endpoint: { wsUrl: "ws://127.0.0.1:9222/devtools/browser/x", userDataDir: PIN.userDataDir } };
-
-  // The locator answers "none" first (which is what triggers a launch), then walks `after`, repeating its last entry.
-  const closed = (opts: {
-    readonly installed: ReadonlyArray<InstalledBrowser>;
-    readonly after?: ReadonlyArray<BrowserLocation>;
-    readonly launchError?: string;
-    readonly display?: boolean;
-    readonly lookupMs?: number;
-  }) => {
-    const launches: BrowserLaunchRequest[] = [];
-    const after = opts.after ?? [UP];
-    let asked = 0;
-    // A clock that only sleeping (and, when asked, a slow lookup) moves, so waits are exact and instant.
-    let clock = 0;
-    const deps: SetupDeps = {
-      now: () => clock,
-      ensureDaemon: () => Promise.resolve(true),
-      readPin: () => Promise.resolve(null),
-      installedBrowsers: () => Promise.resolve(opts.installed),
-      canShowWindow: () => opts.display ?? true,
-      sleep: (ms) => { clock += ms; return Promise.resolve(); },
-      launchBrowser: (req) => {
-        launches.push(req);
-        return Promise.resolve(opts.launchError === undefined ? ok(undefined) : err(opts.launchError));
-      },
-      locateBrowser: () => {
-        const answer: BrowserLocation = asked === 0 ? { kind: "none" } : after[Math.min(asked - 1, after.length - 1)] ?? { kind: "none" };
-        asked++;
-        clock += opts.lookupMs ?? 0;
-        return Promise.resolve(answer);
-      },
-    };
-    return { deps, launches, lookups: () => asked - 1, elapsed: () => clock };
-  };
 
   let agentDir: string;
   let savedAgentDir: string | undefined;
@@ -419,5 +425,96 @@ describe("performSetup with a closed local browser", () => {
     const waited = elapsed() - 5_000;
     assert.ok(lookups() <= 3, `${lookups()} lookups`);
     assert.ok(waited <= 17_000, `waited ${waited}ms`);
+  });
+});
+
+describe("performSetup with the pinned browser closed and another one open", () => {
+  const CHROME: InstalledBrowser = { family: "Chrome", exePath: "/usr/bin/google-chrome" };
+  const BRAVE: InstalledBrowser = { family: "Brave", exePath: "/usr/bin/brave-browser" };
+  const BRAVE_ENDPOINT: BrowserLocation = { kind: "local", endpoint: { wsUrl: "ws://127.0.0.1:9223/devtools/browser/b", userDataDir: "/home/u/.config/BraveSoftware/Brave-Browser" } };
+  const CHROME_RUNNING: RunningBrowser = { running: true, exePath: "/usr/bin/google-chrome" };
+  const BRAVE_RUNNING: RunningBrowser = { running: true, exePath: "/usr/bin/brave-browser" };
+
+  // Reuses the closed() fixture but starts from a reachable endpoint of the OTHER browser instead of "none".
+  const otherOpen = (opts: {
+    readonly installed: ReadonlyArray<InstalledBrowser>;
+    readonly running: RunningBrowser;
+    readonly after?: ReadonlyArray<BrowserLocation>;
+    readonly launchError?: string;
+  }) => {
+    const { deps, launches } = closed({
+      installed: opts.installed,
+      after: [{ ...BRAVE_ENDPOINT }, ...(opts.after ?? [])],
+      running: opts.running,
+      ...(opts.launchError === undefined ? {} : { launchError: opts.launchError }),
+    });
+    return {
+      deps: { ...deps, locateBrowser: () => Promise.resolve({ ...BRAVE_ENDPOINT }) },
+      launches,
+    };
+  };
+
+  test("with a UI the user is asked to open the pinned browser, and on yes it is opened", async () => {
+    const c = await setupClient();
+    const ctx = fakeCtx({ confirms: [true] });
+    const { deps, launches } = otherOpen({ installed: [CHROME, BRAVE], running: BRAVE_RUNNING });
+    const r = await performSetup(c.client, ctx.ctx, deps);
+    assert.ok(r.success);
+    assert.deepEqual(ctx.confirmations.map((q) => q.title), ["Open Chrome?"]);
+    assert.match(ctx.confirmations[0]?.message ?? "", /Brave is open/);
+    assert.match(ctx.confirmations[0]?.message ?? "", /in the profile "Alice"/);
+    assert.deepEqual(launches, [{ exePath: CHROME.exePath, profileDir: "Default" }]);
+    assert.equal(c.started(), 1);
+    assert.match(r.data, /^Opened Chrome\./);
+  });
+
+  test("declining falls through to the open browser instead of failing setup", async () => {
+    const c = await setupClient();
+    const ctx = fakeCtx({ confirms: [false] });
+    const { deps, launches } = otherOpen({ installed: [CHROME, BRAVE], running: BRAVE_RUNNING });
+    const r = await performSetup(c.client, ctx.ctx, deps);
+    assert.ok(r.success);
+    assert.equal(launches.length, 0);
+    assert.equal(c.started(), 1);
+    assert.doesNotMatch(r.data, /Opened Chrome/);
+  });
+
+  test("without a UI the pin is enough: the pinned browser is opened unasked", async () => {
+    const c = await setupClient();
+    const ctx = fakeCtx({ hasUI: false });
+    const { deps, launches } = otherOpen({ installed: [CHROME, BRAVE], running: BRAVE_RUNNING });
+    const r = await performSetup(c.client, ctx.ctx, deps);
+    assert.ok(r.success);
+    assert.deepEqual(ctx.confirmations, []);
+    assert.deepEqual(launches, [{ exePath: CHROME.exePath, profileDir: "Default" }]);
+  });
+
+  test("a launch failure while another browser is open is reported", async () => {
+    const c = await setupClient();
+    const ctx = fakeCtx({ confirms: [true] });
+    const { deps } = otherOpen({ installed: [CHROME, BRAVE], running: BRAVE_RUNNING, launchError: "spawn ENOENT" });
+    const r = await performSetup(c.client, ctx.ctx, deps);
+    assert.equal(r.success, false);
+    assert.equal(r.error, "Could not open Chrome: spawn ENOENT");
+  });
+
+  test("a pinned browser that comes up with remote debugging off gets the enable-debugging hint", async () => {
+    const c = await setupClient({ startError: "DevToolsActivePort not found" });
+    const ctx = fakeCtx({ confirms: [true] });
+    const { deps, launches } = closed({ installed: [CHROME, BRAVE], after: [{ kind: "local" }], running: BRAVE_RUNNING });
+    const r = await performSetup(c.client, ctx.ctx, { ...deps, launchWaitMs: 60_000, launchPollMs: 500 });
+    assert.equal(r.success, false);
+    assert.match(r.error, /^Browser remote debugging needs to be enabled\./);
+    assert.equal(launches.length, 1);
+  });
+
+  test("when the pinned browser is the one that is running, nothing is launched", async () => {
+    const c = await setupClient();
+    const r = await performSetup(c.client, undefined, {
+      ...ready,
+      locateBrowser: () => Promise.resolve({ kind: "local", endpoint: { wsUrl: "ws://127.0.0.1:9222/devtools/browser/x" } }),
+      detectRunningBrowser: () => Promise.resolve(CHROME_RUNNING),
+    });
+    assert.ok(r.success);
   });
 });

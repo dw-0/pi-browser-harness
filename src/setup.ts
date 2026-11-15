@@ -5,6 +5,8 @@ import { DAEMON_SOCKET_PATH } from "./daemon/protocol";
 import { type BrowserLocation, locateBrowser } from "./browser-location";
 import { promptForProfileIfUnset } from "./profile/command";
 import { type InstalledBrowser, chooseBrowserToLaunch, installedBrowsers } from "./profile/installed";
+import { detectRunningBrowser, browserFamilyOf, type RunningBrowser } from "./profile/browser-process";
+import { browserNameForUserDataDir } from "./profile/paths";
 import { type BrowserLaunchRequest, launchBrowser } from "./profile/launch";
 import { type ProfilePin, readPin } from "./profile/store";
 import { sleep } from "./util/sleep";
@@ -17,6 +19,8 @@ export type SetupDeps = {
   // Opening a browser that is closed.
   readonly installedBrowsers?: () => Promise<ReadonlyArray<InstalledBrowser>>;
   readonly launchBrowser?: (req: BrowserLaunchRequest) => Promise<Result<void, string>>;
+  // Which browser family is running right now, given a preferred user-data-dir; the default ranks the pin's family first.
+  readonly detectRunningBrowser?: (preferUserDataDir?: string) => Promise<RunningBrowser>;
   readonly readPin?: () => Promise<ProfilePin | null>;
   readonly canShowWindow?: () => boolean;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -34,42 +38,57 @@ const LAUNCH_WAIT_MS = 15_000;
 const LAUNCH_POLL_MS = 500;
 // How long a browser that is up but has no DevTools endpoint is given before concluding remote debugging is simply off.
 const DEBUGGING_OFF_GRACE_MS = 5_000;
+type LoadedPin = { readonly pin: ProfilePin | null };
 
 // A Linux session with neither X nor Wayland (SSH, a container, CI) cannot show a browser window.
 const hasDisplay = (): boolean =>
   process.platform !== "linux" || Boolean(process.env["DISPLAY"]) || Boolean(process.env["WAYLAND_DISPLAY"]);
 
 type OpenedBrowser = { readonly location: BrowserLocation; readonly family: string };
+// "opened" carries the new location; "skipped" means the user declined while another browser is open, so setup continues with that one; "failed" aborts setup.
+type OpenOutcome =
+  | { readonly kind: "opened"; readonly data: OpenedBrowser }
+  | { readonly kind: "skipped" }
+  | { readonly kind: "failed"; readonly error: string };
 
-// Opens the user's own browser when none is running. It restores their windows and tabs, so it is never a surprise:
+// Opens the user's own browser when it is closed, or switches to it when another browser is the one that is open (`otherFamily`).
+// It restores the pinned browser's windows and tabs, so it is never a surprise:
 // with a UI the user is asked; without one only a saved profile pin, which already says which browser to use, is enough.
 const openClosedBrowser = async (
   client: BrowserClient,
   ctx: ExtensionContext | undefined,
   deps: SetupDeps,
-): Promise<Result<OpenedBrowser, string>> => {
-  if (!(deps.canShowWindow ?? hasDisplay)()) return err(NO_BROWSER);
+  otherFamily?: string,
+): Promise<OpenOutcome> => {
+  if (!(deps.canShowWindow ?? hasDisplay)()) return { kind: "failed", error: NO_BROWSER };
 
   const pin = client.profilePin() ?? (await (deps.readPin ?? readPin)());
   const installed = await (deps.installedBrowsers ?? installedBrowsers)();
   const browser = chooseBrowserToLaunch(installed, pin?.userDataDir);
   if (!browser) {
-    return err(
+    if (otherFamily !== undefined) return { kind: "skipped" };
+    return { kind: "failed", error:
       installed.length > 1 && !pin
         ? `${NO_BROWSER}\n\nMore than one browser is installed (${installed.map((b) => b.family).join(", ")}), so none was opened for you.`
         : NO_BROWSER,
-    );
+    };
   }
 
   if (ctx?.hasUI) {
     const profile = pin ? ` in the profile "${pin.label}"` : "";
-    const agreed = await ctx.ui.confirm(
-      `Open ${browser.family}?`,
-      `No browser is running. pi can open ${browser.family}${profile} for you; your windows and tabs come back as you left them.`,
-    );
-    if (!agreed) return err(NO_BROWSER);
+    const agreed = otherFamily !== undefined
+      ? await ctx.ui.confirm(
+          `Open ${browser.family}?`,
+          `${otherFamily} is open, but your saved profile${profile} belongs to ${browser.family}, which is closed. pi can open ${browser.family} for you; your windows and tabs come back as you left them.`,
+        )
+      : await ctx.ui.confirm(
+          `Open ${browser.family}?`,
+          `No browser is running. pi can open ${browser.family}${profile} for you; your windows and tabs come back as you left them.`,
+        );
+    // Declining while another browser is open falls through to that browser instead of failing setup.
+    if (!agreed) return otherFamily !== undefined ? { kind: "skipped" } : { kind: "failed", error: NO_BROWSER };
   } else if (!pin) {
-    return err(NO_BROWSER);
+    return { kind: "failed", error: NO_BROWSER };
   }
 
   const launched = await (deps.launchBrowser ?? launchBrowser)({
@@ -77,7 +96,7 @@ const openClosedBrowser = async (
     ...(browser.flatpakAppId !== undefined ? { flatpakAppId: browser.flatpakAppId } : {}),
     ...(pin ? { profileDir: pin.profileDir } : {}),
   });
-  if (!launched.success) return err(`Could not open ${browser.family}: ${launched.error}`);
+  if (!launched.success) return { kind: "failed", error: `Could not open ${browser.family}: ${launched.error}` };
 
   // Both limits are measured in elapsed time, not poll counts: a lookup scans processes and can itself take seconds.
   const pause = deps.sleep ?? sleep;
@@ -95,11 +114,17 @@ const openClosedBrowser = async (
     if (now() - upSince >= DEBUGGING_OFF_GRACE_MS) break;
   }
   if (location.kind === "none") {
-    return err(`Opened ${browser.family}, but it did not start. Open it yourself, then run /browser-setup.`);
+    return { kind: "failed", error: `Opened ${browser.family}, but it did not start. Open it yourself, then run /browser-setup.` };
   }
   // Setup started this browser here, so it is local even if the process scan has not caught up with it.
-  return ok({ location: location.endpoint ? { kind: "local", endpoint: location.endpoint } : { kind: "local" }, family: browser.family });
+  return {
+    kind: "opened",
+    data: { location: location.endpoint ? { kind: "local", endpoint: location.endpoint } : { kind: "local" }, family: browser.family },
+  };
 };
+const pinLoaded = async (client: BrowserClient, deps: SetupDeps): Promise<LoadedPin> => ({
+  pin: client.profilePin() ?? await (deps.readPin ?? readPin)(),
+});
 
 export function registerSetupCommand(pi: ExtensionAPI, client: BrowserClient, deps: SetupDeps = {}): void {
   pi.registerCommand("browser-setup", {
@@ -125,11 +150,28 @@ export async function performSetup(
   // Reachability decides whether setup can proceed; a browser process on this machine is not required (it may sit behind a tunnel, on the Windows host of a WSL session, or in a container).
   let location = await (deps.locateBrowser ?? locateBrowser)();
   let openedNote: string | undefined;
+  // A pin names the browser the user wants to work in. When that browser is closed while ANOTHER one is open, the reachable endpoint belongs to the wrong browser, so offer to open the pinned one; a declined offer falls through to the open browser.
+  const { pin } = await pinLoaded(client, deps);
+  if (pin && location.kind !== "remote") {
+    const running = await (deps.detectRunningBrowser ?? detectRunningBrowser)(pin.userDataDir);
+    const runningFamily = running.running ? browserFamilyOf(running) : undefined;
+    const pinnedFamily = browserNameForUserDataDir(pin.userDataDir).toLowerCase();
+    if (running.running && runningFamily?.toLowerCase() !== pinnedFamily) {
+      const opened = await openClosedBrowser(client, ctx, deps, runningFamily);
+      if (opened.kind === "failed") return err(opened.error);
+      if (opened.kind === "opened") {
+        location = opened.data.location;
+        openedNote = `Opened ${opened.data.family}.`;
+      }
+    }
+  }
   if (location.kind === "none") {
     const opened = await openClosedBrowser(client, ctx, deps);
-    if (!opened.success) return opened;
-    location = opened.data.location;
-    openedNote = `Opened ${opened.data.family}.`;
+    if (opened.kind === "failed") return err(opened.error);
+    if (opened.kind === "opened") {
+      location = opened.data.location;
+      openedNote = `Opened ${opened.data.family}.`;
+    }
   }
 
   const daemonReady = await (deps.ensureDaemon ?? ensureDaemon)();

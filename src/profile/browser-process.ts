@@ -156,7 +156,7 @@ export const rankBrowserCandidate = (candidate: BrowserCandidate, preferUserData
     if (family === "chrome" && exe.includes("chrome") && !exe.includes("chromium")) return 3;
     return 1;
   }
-  return candidate.family !== undefined && candidate.family.toLowerCase() === family ? 3 : 1;
+  return candidate.family?.toLowerCase() === family ? 3 : 1;
 };
 
 export const parseUserDataDirFlag = (commandLine: string): string | undefined => {
@@ -377,6 +377,19 @@ export const detectRunningBrowser = async (preferUserDataDir?: string): Promise<
 };
 
 export const isBrowserRunning = async (): Promise<boolean> => (await detectRunningBrowser()).running;
+// The family evidence a RunningBrowser carries: the cgroup's flatpak app id, the executable name, or the user-data-dir. Flatpak first: a sandboxed browser's exePath (argv[0]) would otherwise name the wrong family.
+export const browserFamilyOf = (running: RunningBrowser): string | undefined => {
+  if (running.flatpakAppId) return familyForFlatpakApp(running.flatpakAppId) ?? undefined;
+  const exe = (running.exePath ?? "").toLowerCase();
+  if (exe) {
+    if (exe.includes("brave")) return "Brave";
+    if (exe.includes("edge") || exe.includes("msedge")) return "Edge";
+    if (exe.includes("chromium")) return "Chromium";
+    if (exe.includes("chrome")) return "Chrome";
+  }
+  if (running.explicitUserDataDir) return browserNameForUserDataDir(running.explicitUserDataDir);
+  return undefined;
+};
 
 export const resolveBrowserExecutable = async (running?: RunningBrowser): Promise<string | undefined> => {
   const detected = running ?? (await detectRunningBrowser());

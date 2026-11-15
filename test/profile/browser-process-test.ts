@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  flatpakAppIdFromCgroup,
   isLinuxBrowserComm,
   parseProcCmdline,
   parseUserDataDirFlag,
@@ -77,6 +78,28 @@ describe("browser-process parsing and candidate ranking", () => {
     const match = rankBrowserCandidate({ exePath: "/opt/google/chrome/chrome", explicitUserDataDir: target }, target);
     const noFlag = rankBrowserCandidate({ exePath: "/opt/google/chrome/chrome" }, target);
     assert.ok(match > noFlag);
+  });
+
+  test("B2: a flatpak candidate (no host executable, cgroup app id) outranks a foreign family's spawnable browser", () => {
+    const flatpakChrome = rankBrowserCandidate({ family: "Chrome", flatpakAppId: "com.google.Chrome" }, "/home/u/.var/app/com.google.Chrome/config/google-chrome");
+    const brave = rankBrowserCandidate({ exePath: "/usr/lib/brave.com/brave/brave" }, "/home/u/.var/app/com.google.Chrome/config/google-chrome");
+    assert.equal(flatpakChrome, 3);
+    assert.equal(brave, 1);
+  });
+
+  test("B2: a candidate without an executable or a family hint ranks like any other mismatch", () => {
+    assert.equal(rankBrowserCandidate({}, "/home/u/.config/google-chrome"), 1);
+    assert.equal(rankBrowserCandidate({ family: "Brave" }, "/home/u/.config/google-chrome"), 1);
+  });
+
+  test("F1: the flatpak cgroup scope names its app id", () => {
+    assert.equal(
+      flatpakAppIdFromCgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-com.google.Chrome-2485380143.scope"),
+      "com.google.Chrome",
+    );
+    assert.equal(flatpakAppIdFromCgroup("0::/app/com.brave.Browser-12345.scope"), "com.brave.Browser");
+    assert.equal(flatpakAppIdFromCgroup("0::/system.slice/sshd.service"), undefined);
+    assert.equal(flatpakAppIdFromCgroup(""), undefined);
   });
 
   test("B2: a DIFFERENT explicit user-data-dir ranks below a flagless process", () => {

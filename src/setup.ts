@@ -73,7 +73,8 @@ const openClosedBrowser = async (
   }
 
   const launched = await (deps.launchBrowser ?? launchBrowser)({
-    exePath: browser.exePath,
+    ...(browser.exePath !== undefined ? { exePath: browser.exePath } : {}),
+    ...(browser.flatpakAppId !== undefined ? { flatpakAppId: browser.flatpakAppId } : {}),
     ...(pin ? { profileDir: pin.profileDir } : {}),
   });
   if (!launched.success) return err(`Could not open ${browser.family}: ${launched.error}`);

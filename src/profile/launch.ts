@@ -10,7 +10,9 @@ import { pathToFileURL } from "node:url";
 import { type Result, err, ok } from "../util/result";
 
 export type ProfileWindowRequest = {
-  readonly exePath: string;
+  readonly exePath?: string;
+  // A sandboxed browser (flatpak) that cannot be spawned by host path: launched through `flatpak run <appId>` instead.
+  readonly flatpakAppId?: string;
   readonly profileDir: string;
   readonly explicitUserDataDir?: string;
 };
@@ -58,13 +60,20 @@ export const openProfileWindow = async (
   }
 
   const sentinelUrl = pathToFileURL(file).href;
+  const prefix = req.flatpakAppId !== undefined ? ["run", req.flatpakAppId] : [];
+  const program = req.flatpakAppId !== undefined ? "flatpak" : req.exePath;
   const args: string[] = [];
   if (req.explicitUserDataDir) args.push(`--user-data-dir=${req.explicitUserDataDir}`);
   args.push(`--profile-directory=${req.profileDir}`, "--new-window", sentinelUrl);
 
   const discardSentinel = (): Promise<void> => rm(file, { force: true }).catch(() => undefined);
 
-  const spawned = await spawnDetached(req.exePath, args);
+  if (program === undefined) {
+    await discardSentinel();
+    return err("no browser executable or flatpak app available to open a window");
+  }
+
+  const spawned = await spawnDetached(program, [...prefix, ...args]);
   if (!spawned.success) {
     await discardSentinel();
     return spawned;
@@ -89,7 +98,8 @@ export const openProfileWindow = async (
 };
 
 export type BrowserLaunchRequest = {
-  readonly exePath: string;
+  readonly exePath?: string;
+  readonly flatpakAppId?: string;
   readonly profileDir?: string;
 };
 
@@ -98,6 +108,9 @@ export const browserLaunchArgs = (req: BrowserLaunchRequest): ReadonlyArray<stri
 
 // Opens a browser that is not running. No --user-data-dir and no debugging flag: it starts as the user's own browser, with whatever remote-debugging setting they left it in.
 export const launchBrowser = async (req: BrowserLaunchRequest): Promise<Result<void, string>> => {
-  const spawned = await spawnDetached(req.exePath, browserLaunchArgs(req));
+  const prefix = req.flatpakAppId !== undefined ? ["run", req.flatpakAppId] : [];
+  const program = req.flatpakAppId !== undefined ? "flatpak" : req.exePath;
+  if (program === undefined) return err("no browser executable or flatpak app available to launch");
+  const spawned = await spawnDetached(program, [...prefix, ...browserLaunchArgs(req)]);
   return spawned.success ? ok(undefined) : spawned;
 };

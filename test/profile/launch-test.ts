@@ -1,6 +1,6 @@
 import { test, before, after, describe } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -105,6 +105,45 @@ describe("openProfileWindow's failure reporting", () => {
       r.data.kill();
       r.data.kill();
     });
+  });
+
+  test("L5: a request with neither an executable nor a flatpak app fails without spawning", async () => {
+    const r = await openProfileWindow({ profileDir: "Default" });
+    assert.ok(!r.success);
+    assert.ok(r.error.includes("no browser executable"));
+  });
+});
+
+describe("openProfileWindow's flatpak launch", () => {
+  let root: string;
+
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), "pi-launch-flatpak-"));
+  });
+
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("F1: a flatpak request spawns the flatpak launcher with run <appId> and the profile args", async () => {
+    writeFileSync(join(root, "flatpak"), `#!/bin/sh\nprintf '%s\\0' "$@" > "${root}/argv"\n`, { mode: 0o755 });
+    const oldPath = process.env["PATH"] ?? "";
+    process.env["PATH"] = `${root}:${oldPath}`;
+    try {
+      const r = await openProfileWindow({ flatpakAppId: "com.google.Chrome", profileDir: "Default" });
+      assert.ok(r.success);
+      if (r.success) {
+        // spawn succeeding is not the stub having run: wait for the argv file to appear.
+        const deadline = Date.now() + 2000;
+        while (!existsSync(join(root, "argv")) && Date.now() < deadline) await new Promise((res) => setTimeout(res, 20));
+        await r.data.cleanup();
+      }
+    } finally {
+      process.env["PATH"] = oldPath;
+    }
+    const argv = readFileSync(join(root, "argv"), "utf8").split("\0").filter(Boolean);
+    assert.deepEqual(argv, ["run", "com.google.Chrome", "--profile-directory=Default", "--new-window", argv.at(-1)]);
+    assert.match(argv.at(-1) ?? "", /^file:\/\//);
   });
 });
 

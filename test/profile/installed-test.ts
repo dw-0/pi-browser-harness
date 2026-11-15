@@ -23,6 +23,42 @@ describe("installedBrowsers", () => {
     assert.deepEqual(await installedBrowsers({ platform: "linux", env: {}, home: "/home/u", isExecutable: only("/usr/bin/google-chrome") }), []);
   });
 
+  test("linux: a flatpak app with no PATH entry is found by its app id, when the flatpak launcher is on PATH", async () => {
+    const found = await installedBrowsers({
+      platform: "linux",
+      arch: "x64",
+      env: { PATH: "/usr/bin" },
+      home: "/home/u",
+      isExecutable: only("/usr/bin/flatpak"),
+      hasFlatpakApp: (appId: string) => Promise.resolve(appId === "com.google.Chrome"),
+    });
+    assert.deepEqual(found, [{ family: "Chrome", flatpakAppId: "com.google.Chrome" }]);
+  });
+
+  test("linux: a command-line install wins over a flatpak one of the same family", async () => {
+    const found = await installedBrowsers({
+      platform: "linux",
+      arch: "x64",
+      env: { PATH: "/usr/bin" },
+      home: "/home/u",
+      isExecutable: only("/usr/bin/google-chrome", "/usr/bin/flatpak"),
+      hasFlatpakApp: (appId: string) => Promise.resolve(appId === "com.google.Chrome"),
+    });
+    assert.deepEqual(found, [{ family: "Chrome", exePath: "/usr/bin/google-chrome" }]);
+  });
+
+  test("linux: without the flatpak launcher on PATH, flatpak apps are not found", async () => {
+    const found = await installedBrowsers({
+      platform: "linux",
+      arch: "x64",
+      env: { PATH: "/usr/bin" },
+      home: "/home/u",
+      isExecutable: only("/usr/bin/google-chrome"),
+      hasFlatpakApp: () => Promise.resolve(true),
+    });
+    assert.deepEqual(found, [{ family: "Chrome", exePath: "/usr/bin/google-chrome" }]);
+  });
+
   test("macOS: app bundles are found in /Applications and the user's own Applications folder", async () => {
     const found = await installedBrowsers({
       platform: "darwin",

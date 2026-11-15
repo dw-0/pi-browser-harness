@@ -9,7 +9,8 @@ import { browserNameForUserDataDir } from "./paths";
 export type InstalledBrowser = {
   // The same name browserNameForUserDataDir gives a profile directory, so a pin can be matched to its browser.
   readonly family: string;
-  readonly exePath: string;
+  readonly exePath?: string;
+  readonly flatpakAppId?: string;
 };
 
 export type InstalledBrowsersDeps = {
@@ -17,6 +18,8 @@ export type InstalledBrowsersDeps = {
   readonly env?: NodeJS.ProcessEnv;
   readonly home?: string;
   readonly isExecutable?: (path: string) => Promise<boolean>;
+  readonly arch?: string;
+  readonly hasFlatpakApp?: (appId: string, arch: string) => Promise<boolean>;
 };
 
 const canExecute = async (path: string): Promise<boolean> => {
@@ -43,7 +46,28 @@ const MAC_APPS: ReadonlyArray<readonly [family: string, app: string]> = [
   ["Edge", "Microsoft Edge"],
 ];
 
-const candidatesFor = (platform: NodeJS.Platform, env: NodeJS.ProcessEnv, home: string): ReadonlyArray<InstalledBrowser> => {
+// A flatpak app installs under /var/lib/flatpak/app/<appId>/<arch>/; there is no PATH entry, so the plain command scan never sees it.
+const FLATPAK_APPS: ReadonlyArray<readonly [family: string, appId: string]> = [
+  ["Chrome", "com.google.Chrome"],
+  ["Chromium", "org.chromium.Chromium"],
+  ["Brave", "com.brave.Browser"],
+  ["Edge", "com.microsoft.Edge"],
+];
+const FLATPAK_ARCH: ReadonlyArray<readonly [arch: string, dir: string]> = [
+  ["x64", "x86_64"],
+  ["arm64", "aarch64"],
+];
+
+const flatpakAppInstalled = async (appId: string, arch: string): Promise<boolean> => {
+  try {
+    await access(posix.join("/var/lib/flatpak/app", appId, arch));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const candidatesFor = (platform: NodeJS.Platform, env: NodeJS.ProcessEnv, home: string): ReadonlyArray<{ readonly family: string; readonly exePath: string }> => {
   if (platform === "darwin") {
     const roots = ["/Applications", posix.join(home, "Applications")];
     return MAC_APPS.flatMap(([family, app]) =>
@@ -68,6 +92,26 @@ export const installedBrowsers = async (deps: InstalledBrowsersDeps = {}): Promi
   for (const candidate of candidatesFor(deps.platform ?? process.platform, deps.env ?? process.env, deps.home ?? homedir())) {
     if (found.has(candidate.family)) continue;
     if (await isExecutable(candidate.exePath)) found.set(candidate.family, candidate);
+  }
+  // A command-line install wins over the flatpak one: both use the same family name and profile store.
+  if ((deps.platform ?? process.platform) === "linux") {
+    const env = deps.env ?? process.env;
+    const arch = FLATPAK_ARCH.find(([a]) => a === (deps.arch ?? process.arch))?.[1];
+    let flatpakBin: string | undefined;
+    for (const dir of (env["PATH"] ?? "").split(":")) {
+      if (!dir) continue;
+      const candidate = posix.join(dir, "flatpak");
+      if (await isExecutable(candidate)) {
+        flatpakBin = candidate;
+        break;
+      }
+    }
+    if (arch && flatpakBin !== undefined) {
+      for (const [family, appId] of FLATPAK_APPS) {
+        if (found.has(family)) continue;
+        if (await (deps.hasFlatpakApp ?? flatpakAppInstalled)(appId, arch)) found.set(family, { family, flatpakAppId: appId });
+      }
+    }
   }
   return Array.from(found.values());
 };

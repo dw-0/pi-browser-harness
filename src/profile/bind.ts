@@ -63,7 +63,7 @@ export const seedProfileWindow = async (
   const targetUserDataDir = connectedDir ?? pin.userDataDir;
   const running = await detect(targetUserDataDir);
   const exePath = await resolveExe(running);
-  if (!exePath) {
+  if (!exePath && !running.flatpakAppId) {
     return err(cdpError(
       "discovery_failed",
       `could not locate the browser executable needed to open "${pin.label}" — ${manualFallbackHint(pin)}`,
@@ -71,7 +71,9 @@ export const seedProfileWindow = async (
   }
 
   const launched = await launch({
-    exePath,
+    ...(exePath !== undefined ? { exePath } : {}),
+    // A sandboxed browser (flatpak) cannot be spawned by its host path; `flatpak run` does. Launching the raw binary would land in a different profile than the running instance.
+    ...(running.flatpakAppId !== undefined ? { flatpakAppId: running.flatpakAppId } : {}),
     profileDir: pin.profileDir,
     // ProcessSingleton keys on the user-data-dir path, so forward only the value the running browser reports: a reconstructed one may differ by case and start a SECOND browser.
     ...(running.explicitUserDataDir ? { explicitUserDataDir: running.explicitUserDataDir } : {}),

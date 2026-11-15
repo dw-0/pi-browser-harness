@@ -17,6 +17,7 @@ export type RunningBrowser = {
   readonly running: boolean;
   readonly exePath?: string;
   readonly explicitUserDataDir?: string;
+  readonly flatpakAppId?: string;
 };
 
 const LINUX_COMMS: ReadonlyArray<string> = [
@@ -74,6 +75,9 @@ const isMacChildProcessName = (comm: string): boolean => {
 export type BrowserCandidate = {
   readonly exePath?: string;
   readonly explicitUserDataDir?: string;
+  // A sandboxed process (flatpak) whose /proc/<pid>/exe resolves inside its own mount namespace: no host-spawnable executable, so the cgroup's app id is the family evidence.
+  readonly family?: string;
+  readonly flatpakAppId?: string;
 };
 
 // A package upgrade under a running browser makes `/proc/<pid>/exe` read "… (deleted)", which fails to spawn with ENOENT unless the marker comes off.
@@ -101,6 +105,35 @@ export const spawnableExePath = async (raw: string): Promise<string | undefined>
   return undefined;
 };
 
+// cgroup v2 scopes look like "app-flatpak-com.google.Chrome-2485380143.scope" (v1: "app/com.google.Chrome-…"), the app id being dotted and the serial numeric.
+const FLATPAK_CGROUP = /app(?:-flatpak)?[-/]([a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+)-\d+\.scope/i;
+
+// A sandboxed browser (flatpak) exposes /proc/<pid>/exe inside its own mount namespace, a path that does not exist on the host: the cgroup scope is the only family evidence left.
+export const flatpakAppIdFromCgroup = (raw: string): string | undefined => FLATPAK_CGROUP.exec(raw)?.[1];
+
+const FLATPAK_APP_FAMILIES: ReadonlyArray<readonly [prefix: string, family: string]> = [
+  ["com.google.chrome", "Chrome"],
+  ["com.brave.browser", "Brave"],
+  ["org.chromium", "Chromium"],
+  ["com.microsoft.edge", "Edge"],
+];
+
+const familyForFlatpakApp = (appId: string): string | undefined =>
+  FLATPAK_APP_FAMILIES.find(([prefix]) => appId.toLowerCase().startsWith(prefix))?.[1];
+
+const flatpakAppIdFromProc = async (pid: string): Promise<{ readonly appId: string; readonly family?: string } | undefined> => {
+  let raw: string;
+  try {
+    raw = await readFile(`/proc/${pid}/cgroup`, "utf8");
+  } catch {
+    return undefined;
+  }
+  const appId = flatpakAppIdFromCgroup(raw);
+  if (!appId) return undefined;
+  const family = familyForFlatpakApp(appId);
+  return { appId, ...(family ? { family } : {}) };
+};
+
 const samePath = (a: string, b: string): boolean => {
   const norm = (p: string): string => {
     const unified = p.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -116,12 +149,14 @@ export const rankBrowserCandidate = (candidate: BrowserCandidate, preferUserData
   }
   const family = browserNameForUserDataDir(preferUserDataDir).toLowerCase();
   const exe = (candidate.exePath ?? "").toLowerCase();
-  if (!exe) return 1;
-  if (family === "brave" && exe.includes("brave")) return 3;
-  if (family === "edge" && (exe.includes("edge") || exe.includes("msedge"))) return 3;
-  if (family === "chromium" && exe.includes("chromium")) return 3;
-  if (family === "chrome" && exe.includes("chrome") && !exe.includes("chromium")) return 3;
-  return 1;
+  if (exe) {
+    if (family === "brave" && exe.includes("brave")) return 3;
+    if (family === "edge" && (exe.includes("edge") || exe.includes("msedge"))) return 3;
+    if (family === "chromium" && exe.includes("chromium")) return 3;
+    if (family === "chrome" && exe.includes("chrome") && !exe.includes("chromium")) return 3;
+    return 1;
+  }
+  return candidate.family !== undefined && candidate.family.toLowerCase() === family ? 3 : 1;
 };
 
 export const parseUserDataDirFlag = (commandLine: string): string | undefined => {
@@ -168,9 +203,12 @@ const collectLinux = async (): Promise<ReadonlyArray<BrowserCandidate>> => {
       (link ? await spawnableExePath(link) : undefined) ??
       (await spawnableExePath(argv0));
     const explicit = userDataDirFromArgv(argv);
+    // No host-spawnable executable: the process is sandboxed (flatpak), and its cgroup scope names the app.
+    const flatpak = exePath === undefined ? await flatpakAppIdFromProc(pid) : undefined;
     candidates.push({
       ...(exePath ? { exePath } : {}),
       ...(explicit ? { explicitUserDataDir: explicit } : {}),
+      ...(flatpak ? { flatpakAppId: flatpak.appId, ...(flatpak.family ? { family: flatpak.family } : {}) } : {}),
     });
   }
   return candidates;
@@ -334,6 +372,7 @@ export const detectRunningBrowser = async (preferUserDataDir?: string): Promise<
     running: true,
     ...(best.exePath ? { exePath: best.exePath } : {}),
     ...(best.explicitUserDataDir ? { explicitUserDataDir: best.explicitUserDataDir } : {}),
+    ...(best.flatpakAppId ? { flatpakAppId: best.flatpakAppId } : {}),
   };
 };
 

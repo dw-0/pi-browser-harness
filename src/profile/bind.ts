@@ -4,6 +4,7 @@ import { type CdpError, cdpError } from "../cdp/errors";
 import { borrowSession } from "../cdp/target-factory";
 import { type Result, err, map, ok, unwrapOr } from "../util/result";
 import { sleep as sleepMs } from "../util/sleep";
+import { createInBackground } from "../util/activation";
 import { detectRunningBrowser, resolveBrowserExecutable, type RunningBrowser } from "./browser-process";
 import { openProfileWindow, type ProfileWindowHandle, type ProfileWindowRequest } from "./launch";
 import type { ProfilePin } from "./store";
@@ -34,6 +35,25 @@ const pageTargets = async (client: BrowserClient): Promise<ReadonlyArray<PageTar
   );
 };
 
+// A page in the browser's default context (= the pinned profile), used as the opener for the seed
+// tab so it lands as a sibling in the user's window. CDP reports default-context targets with an
+// omitted or empty browserContextId on some builds, so match both shapes; an empty string default
+// id only lines up with an empty/omitted target id. Returns undefined when no default-context page
+// is found, in which case the caller falls back to a fresh window.
+const defaultContextPage = async (
+  client: BrowserClient,
+  targets: ReadonlyArray<PageTarget>,
+): Promise<string | undefined> => {
+  if (targets.length === 0) return undefined;
+  const contexts = await client.session().callBrowser("Target.getBrowserContexts", {});
+  const defaultCtx = contexts.success ? contexts.data.defaultBrowserContextId : undefined;
+  if (defaultCtx === undefined) return undefined;
+  const match = (t: PageTarget): boolean =>
+    t.browserContextId === defaultCtx ||
+    (defaultCtx === "" && (t.browserContextId === undefined || t.browserContextId === ""));
+  return targets.find(match)?.targetId;
+};
+
 const manualFallbackHint = (pin: ProfilePin): string =>
   `open a window for "${pin.label}" yourself (browser profile menu → ${pin.profileDir}), then retry. ` +
   `Run /browser-profile to pick a different profile, or clear the selection to use whichever window is focused.`;
@@ -62,6 +82,39 @@ export const seedProfileWindow = async (
 
   const targetUserDataDir = connectedDir ?? pin.userDataDir;
   const running = await detect(targetUserDataDir);
+
+  // The pinned browser is already up and the harness is connected to it (seeding runs after
+  // discovery). The connected browser IS the pinned profile (verified above), so its default
+  // context is that profile. Open the seed as a tab in the user's existing window: a fresh
+  // process launch would start a second instance, and a separate window (newWindow) would leave
+  // a second chrome window on screen that the user never opened.
+  if (running.running) {
+    const targets = await pageTargets(client);
+    const opener = await defaultContextPage(client, targets);
+    const created = await client.session().callBrowser(
+      "Target.createTarget",
+      opener !== undefined
+        ? { url: "about:blank", openerId: opener, ...createInBackground() }
+        : { url: "about:blank", newWindow: true, ...createInBackground() },
+    );
+    if (!created.success) return created;
+    const targetId = created.data.targetId;
+    // The created tab's context is the pinned profile's — the only way to learn it, so later
+    // calls can verify a tab's profile.
+    const info = (await pageTargets(client)).find((t) => t.targetId === targetId);
+    if (info?.browserContextId) client.setProfileContextId(info.browserContextId);
+
+    const ownership = client.ownership();
+    ownership.setHarnessWindow(targetId);
+    ownership.add(targetId);
+    const win = await client.session().windowId(targetId);
+    if (win.success) ownership.setHarnessWindowId(win.data);
+
+    return ok(targetId);
+  }
+
+  // No browser process is running (unreachable in the normal flow, where discovery connects
+  // first): launch one and wait for the sentinel window it opens.
   const exePath = await resolveExe(running);
   if (!exePath && !running.flatpakAppId) {
     return err(cdpError(

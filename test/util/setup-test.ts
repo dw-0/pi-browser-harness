@@ -79,7 +79,6 @@ type SetupClient = {
 // configurable start / newTab / pageInfo outcomes.
 const setupClient = async (opts: {
   readonly startError?: string;
-  readonly newTabError?: string;
   readonly dialog?: boolean;
   readonly pin?: ProfilePin | null;
 } = {}): Promise<SetupClient> => {
@@ -92,13 +91,11 @@ const setupClient = async (opts: {
       started++;
       return Promise.resolve(opts.startError === undefined ? ok(undefined) : err(cdpError("discovery_failed", opts.startError)));
     },
-    newTab: () => Promise.resolve(
-      opts.newTabError === undefined ? ok("t-new") : err(cdpError("timeout", opts.newTabError)),
-    ),
+    newTab: fake.client.newTab,
     pageInfo: () => Promise.resolve(ok(
       opts.dialog
         ? { kind: "dialog", dialog: { type: "alert", message: "hi" } }
-        : { kind: "page", url: "https://github.com/", title: "GitHub", width: 1280, height: 720, scrollX: 0, scrollY: 0, pageWidth: 1280, pageHeight: 2000 },
+        : { kind: "page", url: "about:blank", title: "", width: 1280, height: 720, scrollX: 0, scrollY: 0, pageWidth: 1280, pageHeight: 2000 },
     )),
   };
   return { client, fake, started: () => started };
@@ -122,7 +119,7 @@ describe("registerSetupCommand", () => {
     registerSetupCommand(pi.pi, c.client, ready);
     const ctx = fakeCtx();
     await pi.command("browser-setup").handler("", ctx.ctx);
-    assert.deepEqual(ctx.notices, [{ message: "Browser connected ✓\nNavigated to: https://github.com/", type: "info" }]);
+    assert.deepEqual(ctx.notices, [{ message: "Browser connected ✓\nActive tab: about:blank", type: "info" }]);
   });
 
   test("the handler notifies a failure as an error", async () => {
@@ -156,11 +153,11 @@ describe("performSetup", () => {
     rmSync(agentDir, { recursive: true, force: true });
   });
 
-  test("with a running browser and a daemon it starts the client, opens the test tab and reports the page", async () => {
+  test("with a running browser and a daemon it starts the client and reports the attached page", async () => {
     const c = await setupClient();
     const r = await performSetup(c.client, undefined, ready);
     assert.ok(r.success);
-    assert.equal(r.data, "Browser connected ✓\nNavigated to: https://github.com/");
+    assert.equal(r.data, "Browser connected ✓\nActive tab: about:blank");
     assert.equal(c.started(), 1);
     assert.equal(c.fake.callsTo("Page.handleJavaScriptDialog").length, 0);
   });
@@ -169,7 +166,7 @@ describe("performSetup", () => {
     const c = await setupClient({ pin: null });
     const r = await performSetup(c.client, fakeCtx({ hasUI: false }).ctx, ready);
     assert.ok(r.success);
-    assert.match(r.data, /^Browser connected ✓\nNavigated to: https:\/\/github\.com\/\nNo browser profile selected/);
+    assert.match(r.data, /^Browser connected ✓\nActive tab: about:blank\nNo browser profile selected/);
   });
 
   test("no browser anywhere stops before the daemon or the client are touched, and says how to reach a remote one", async () => {
@@ -204,7 +201,7 @@ describe("performSetup", () => {
     });
     assert.ok(r.success);
     assert.equal(c.started(), 1);
-    assert.match(r.data, /^Browser connected ✓\nNavigated to: https:\/\/github\.com\/\nRemote browser: profile selection is unavailable/);
+    assert.match(r.data, /^Browser connected ✓\nActive tab: about:blank\nRemote browser: profile selection is unavailable/);
   });
 
   test("a remote browser skips the profile prompt: no profile is offered or pinned from this machine", async () => {
@@ -246,19 +243,11 @@ describe("performSetup", () => {
     assert.equal(r.error, "Connection failed: daemon socket vanished");
   });
 
-  test("a failed test navigation is reported after the client connected", async () => {
-    const c = await setupClient({ newTabError: "Target.createTarget timed out" });
-    const r = await performSetup(c.client, undefined, ready);
-    assert.equal(r.success, false);
-    assert.equal(r.error, "Browser connected but test navigation failed: Target.createTarget timed out");
-    assert.equal(c.started(), 1);
-  });
-
-  test("an open dialog on the test tab is accepted and the URL falls back to github.com", async () => {
+  test("an open dialog on the attached tab is accepted and the URL falls back to about:blank", async () => {
     const c = await setupClient({ dialog: true });
     const r = await performSetup(c.client, undefined, ready);
     assert.ok(r.success);
-    assert.equal(r.data, "Browser connected ✓\nNavigated to: github.com");
+    assert.equal(r.data, "Browser connected ✓\nActive tab: about:blank");
     const accepted = c.fake.callsTo("Page.handleJavaScriptDialog");
     assert.equal(accepted.length, 1);
     assert.deepEqual(accepted[0]?.params, { accept: true });

@@ -209,18 +209,14 @@ export async function performSetup(
     return err(`Connection failed: ${msg}`);
   }
 
-  const tabResult = await client.newTab("https://github.com");
-  if (!tabResult.success) {
-    return err(`Browser connected but test navigation failed: ${tabResult.error.message}`);
-  }
-
+  // start() already attached the harness page (first live owned tab, or a seeded one), so no tab is opened here.
   const info = await client.pageInfo();
   if (info.success && info.data.kind === "dialog") {
     await client.session().call("Page.handleJavaScriptDialog", { accept: true });
   }
 
-  const pageUrl = info.success && info.data.kind === "page" ? info.data.url : "github.com";
-  const lines = [...(openedNote ? [openedNote] : []), "Browser connected ✓", `Navigated to: ${pageUrl}`];
+  const pageUrl = info.success && info.data.kind === "page" ? info.data.url : "about:blank";
+  const lines = [...(openedNote ? [openedNote] : []), "Browser connected ✓", `Active tab: ${pageUrl}`];
   if (profileNote) lines.push(profileNote);
   return ok(lines.join("\n"));
 }
